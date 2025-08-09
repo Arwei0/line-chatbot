@@ -356,11 +356,11 @@ def handle_text(event):
             engine = "openai" if client_openai else ("gemini" if client_gemini else "echo")
             final_reply = f"目前引擎：{engine}"
         else:
-            final_reply = ask_ai(text_raw) or f"你說：{text_raw}"
+            final_reply = ask_ai(text_raw) or f""
 
     except Exception as e:
         print("[handler] error:", e)
-        final_reply = f"你說：{text_raw}"
+        final_reply = f""
 
     # 取消 typing（如果還沒送出）
     try:
