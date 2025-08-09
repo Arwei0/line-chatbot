@@ -289,9 +289,8 @@ def handle_text(event):
                     "question": text_raw
                 }
                 qr = QuickReply(items=[QuickReplyButton(action=MessageAction(label="抽牌", text="抽牌"))])
-                msg = (f"問題：{text_raw}\n請選擇第 1 張牌（1~78 的數字），或點下方『抽牌』按鈕。"
-                       
-  if typing_timer: typing_timer.cancel()
+                     "問題：今日運勢\n請選擇 1~78 的數字，或點下方『抽牌』按鈕。")
+                if typing_timer: typing_timer.cancel()
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=qr))
                 return
 
