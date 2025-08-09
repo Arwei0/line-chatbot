@@ -2,7 +2,7 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-import os
+import os, time
 from dotenv import load_dotenv
 
 # 讀 .env（支援含 BOM）
@@ -26,34 +26,31 @@ print("[env] LINE_TOKEN:", _mask(CHANNEL_ACCESS_TOKEN),
       "GEMINI:", bool(GEMINI_API_KEY))
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
-    raise RuntimeError("缺少 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET，請檢查 .env 與路徑。")
+    raise RuntimeError("缺少 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET，請檢查環境變數。")
 
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# === AI 客戶端 ===
+# === AI 客戶端（有誰就用誰；兩個都有優先 OpenAI） ===
 client_openai = None
 client_gemini = None
-
 if OPENAI_API_KEY:
     try:
         from openai import OpenAI
         client_openai = OpenAI(api_key=OPENAI_API_KEY)
     except Exception as e:
-        print("[init] OpenAI 初始化失敗：", e)
-
+        print("[init] OpenAI init error:", e)
 if GEMINI_API_KEY and client_openai is None:
     try:
         import google.generativeai as genai
         genai.configure(api_key=GEMINI_API_KEY)
         client_gemini = genai.GenerativeModel("gemini-1.5-flash")
     except Exception as e:
-        print("[init] Gemini 初始化失敗：", e)
+        print("[init] Gemini init error:", e)
 
 SYSTEM_PROMPT = "你是友善、清楚的中文助理，回覆要重點清楚、必要時給步驟與範例。"
 
 def ask_ai(user_text: str) -> str:
-    """依照可用金鑰選擇 AI；失敗時丟例外讓上層回退 Echo。"""
     if client_openai:
         print("[ai] using openai")
         resp = client_openai.chat.completions.create(
@@ -66,39 +63,46 @@ def ask_ai(user_text: str) -> str:
             timeout=20,
         )
         return (resp.choices[0].message.content or "").strip()
-
     if client_gemini:
         print("[ai] using gemini")
         resp = client_gemini.generate_content(user_text)
         return (getattr(resp, "text", "") or "").strip()
-
     print("[ai] no api key -> echo")
     return f"你說：{user_text}"
 
-# === 群組觸發詞設定 ===
+# === 群組觸發詞 ===
 GROUP_TRIGGERS = ("@bot", "/ai", "小幫手")
+TYPING_DELAY_SEC = 0  # 想固定延遲可改成 1.2 之類
 
 def _should_reply_in_context(event, text_lower: str) -> bool:
-    """私訊 -> 一律回；群組/多人聊天室 -> 需要觸發詞開頭"""
-    src_type = getattr(event.source, "type", "user")
-    if src_type == "user":
+    st = getattr(event.source, "type", "user")
+    if st == "user":
         return True
     return any(text_lower.startswith(t) for t in GROUP_TRIGGERS)
 
 def _strip_trigger_prefix(text_raw: str) -> str:
-    """去掉觸發詞前綴"""
     tl = text_raw.strip().lower()
     for t in GROUP_TRIGGERS:
         if tl.startswith(t):
             return text_raw[len(t):].strip()
     return text_raw
 
+def _push_target_id(event):
+    st = getattr(event.source, "type", "user")
+    if st == "user":
+        return event.source.user_id
+    if st == "group":
+        return event.source.group_id
+    if st == "room":
+        return event.source.room_id
+    return None
+
 # --- 健康檢查 ---
 @app.get("/")
 def health():
     return "OK"
 
-# --- LINE Webhook ---
+# --- Webhook 路由 ---
 @app.post("/callback")
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -109,48 +113,65 @@ def callback():
         abort(400)
     return "OK"
 
-@app.post("/webhook")
+@app.post("/webhook")  # 若後台填 /webhook 也相容
 def webhook_alias():
     return callback()
 
+# --- 文字訊息處理 ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text_raw = (event.message.text or "").strip()
     text_lower = text_raw.lower()
 
-    # 判斷是否該回覆（群組需要觸發詞）
+    # 群組/聊天室：沒叫到就不回
     if not _should_reply_in_context(event, text_lower):
         return
 
-    # 如果有觸發詞，把它去掉
+    # 去掉觸發詞
     text_raw = _strip_trigger_prefix(text_raw)
     text_lower = text_raw.lower()
 
-    # --- 固定指令 ---
+    # 先回「…」當 typing 指示（reply_token 只能用一次）
+    try:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="…"))
+    except Exception as e:
+        print("[typing] reply '…' failed:", e)
+
+    # 準備真正回覆內容
     if text_lower in ("hi", "hello", "嗨"):
-        reply = "哈囉，我是你的小助理！輸入 /help 看功能。"
+        final_reply = "哈囉，我是你的小助理！輸入 /help 看功能。"
     elif text_lower == "/help":
-        reply = ("指令：\n"
-                 "- /id：顯示你的使用者ID\n"
-                 "- /time：伺服器時間\n"
-                 "- /engine：目前使用的回覆引擎\n"
-                 "- 其他訊息：由 AI 回覆（若無 API key 則回 Echo）")
+        final_reply = ("指令：\n"
+                       "- /id：顯示你的使用者ID\n"
+                       "- /time：伺服器時間\n"
+                       "- /engine：目前使用的回覆引擎\n"
+                       "- 其他訊息：由 AI 回覆（若無 API key 則回 Echo）")
     elif text_lower == "/id":
-        reply = f"你的ID：{event.source.user_id}"
+        final_reply = f"你的ID：{event.source.user_id}"
     elif text_lower == "/time":
         import datetime
-        reply = f"現在時間：{datetime.datetime.now()}"
+        final_reply = f"現在時間：{datetime.datetime.now()}"
     elif text_lower == "/engine":
         engine = "openai" if client_openai else ("gemini" if client_gemini else "echo")
-        reply = f"目前引擎：{engine}"
+        final_reply = f"目前引擎：{engine}"
     else:
         try:
-            reply = ask_ai(text_raw) or f"你說：{text_raw}"
+            final_reply = ask_ai(text_raw) or f"你說：{text_raw}"
         except Exception as e:
             print("[ai] error -> fallback echo:", e)
-            reply = f"你說：{text_raw}"
+            final_reply = f"你說：{text_raw}"
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+    # 可選固定延遲，讓「…」多停留一下
+    if TYPING_DELAY_SEC > 0:
+        time.sleep(TYPING_DELAY_SEC)
+
+    # 用 push 把真正回覆送到同一個對話
+    target_id = _push_target_id(event)
+    if target_id:
+        try:
+            line_bot_api.push_message(target_id, TextSendMessage(text=final_reply))
+        except Exception as e:
+            print("[push] failed:", e)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
