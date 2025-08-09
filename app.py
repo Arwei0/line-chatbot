@@ -3,7 +3,8 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
-    ImageMessage, ImageSendMessage
+    ImageMessage, ImageSendMessage,
+    QuickReply, QuickReplyButton, MessageAction
 )
 import os, uuid, base64, random, threading
 from dotenv import load_dotenv
@@ -45,7 +46,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 def serve_file(fname):
     return send_from_directory(UPLOAD_DIR, fname, as_attachment=False)
 
-# === AI 客戶端（有 OpenAI 就用；否則用 Gemini；都沒有就 Echo） ===
+# === AI 客戶端（可選） ===
 client_openai = None
 client_gemini = None
 if OPENAI_API_KEY:
@@ -64,7 +65,7 @@ if GEMINI_API_KEY and client_openai is None:
 
 SYSTEM_PROMPT = "你是友善、清楚的中文助理，回覆要重點清楚、必要時給步驟與範例。"
 
-def ask_ai(user_text: str) -> str:
+def ask_ai(user_text):
     if client_openai:
         resp = client_openai.chat.completions.create(
             model="gpt-4o-mini",
@@ -81,8 +82,8 @@ def ask_ai(user_text: str) -> str:
         return (getattr(resp, "text", "") or "").strip()
     return f"你說：{user_text}"
 
-# === 可選：OpenAI 生圖（若你日後啟用） ===
-def generate_image_openai(prompt: str, size: str = "1024x1024") -> str:
+# === 可選：OpenAI 生圖（未使用時可忽略） ===
+def generate_image_openai(prompt, size="1024x1024"):
     if not client_openai:
         raise RuntimeError("缺少 OPENAI_API_KEY，無法生成圖片")
     result = client_openai.images.generate(
@@ -102,13 +103,13 @@ def generate_image_openai(prompt: str, size: str = "1024x1024") -> str:
 # === 群組觸發詞 ===
 GROUP_TRIGGERS = ("@bot", "/ai", "小幫手")
 
-def _should_reply_in_context(event, text_lower: str) -> bool:
+def _should_reply_in_context(event, text_lower):
     st = getattr(event.source, "type", "user")
     if st == "user":
         return True
     return any(text_lower.startswith(t) for t in GROUP_TRIGGERS)
 
-def _strip_trigger_prefix(text_raw: str) -> str:
+def _strip_trigger_prefix(text_raw):
     tl = text_raw.strip().lower()
     for t in GROUP_TRIGGERS:
         if tl.startswith(t):
@@ -138,7 +139,7 @@ def _schedule_typing(target_id, delay=TYPING_DELAY_SEC):
     return t
 
 # === Pexels 搜圖 ===
-def pexels_search_image(query: str) -> str | None:
+def pexels_search_image(query):
     if not PEXELS_API_KEY:
         return None
     try:
@@ -156,7 +157,7 @@ def pexels_search_image(query: str) -> str | None:
         print("[pexels] search error:", e)
         return None
 
-# === Tarot deck (Major Arcana, 簡要牌義) ===
+# === Tarot（簡要牌義：大牌 22 張；可後續擴到 78） ===
 TAROT_CARDS = [
     ("愚者 The Fool", "新的開始、冒險、自由", "魯莽、猶豫、缺乏計畫"),
     ("魔術師 The Magician", "行動力、資源、實現", "欺瞞、方向不清、資源錯配"),
@@ -181,32 +182,30 @@ TAROT_CARDS = [
     ("審判 Judgement", "覺醒、召喚、復甦", "自我苛責、猶疑"),
     ("世界 The World", "完成、整合、成就", "未竟之事、收尾拖延"),
 ]
+POS_LABELS = ["過去", "現在", "未來"]
 
-def draw_tarot(n=1):
-    cards = random.sample(TAROT_CARDS, k=min(n, len(TAROT_CARDS)))
-    result = []
-    for name, up, rev in cards:
-        is_rev = random.random() < 0.5  # 50% 機率逆位
-        result.append((name, up, rev, is_rev))
-    return result
+# 占卜會話暫存
+TAROT_SESSIONS = {}  # key=(source_type,id) -> {"mode":1|3, "remaining":int, "picked":[(name,up,rev,is_rev)], "question":str}
 
-def tarot_to_text(spread, positions=None):
-    lines = []
-    if positions and len(positions) == len(spread):
-        for (name, up, rev, is_rev), pos in zip(spread, positions):
-            meaning = rev if is_rev else up
-            state = "逆位" if is_rev else "正位"
-            lines.append(f"{pos}：{name}（{state}）\n→ {meaning}")
-    else:
-        for (name, up, rev, is_rev) in spread:
-            meaning = rev if is_rev else up
-            state = "逆位" if is_rev else "正位"
-            lines.append(f"{name}（{state}）\n→ {meaning}")
-    return "\n\n".join(lines)
+def chat_key(event):
+    t = getattr(event.source, "type", "user")
+    if t == "user":
+        return ("user", event.source.user_id)
+    if t == "group":
+        return ("group", event.source.group_id)
+    if t == "room":
+        return ("room", event.source.room_id)
+    return ("user", None)
 
-def tarot_cover_image(query_hint="Tarot card"):
-    img = pexels_search_image(query_hint) if PEXELS_API_KEY else None
-    return img or "https://picsum.photos/1024"
+def draw_one_tarot():
+    name, up, rev = random.choice(TAROT_CARDS)
+    is_rev = random.random() < 0.5
+    return name, up, rev, is_rev
+
+def tarot_line(name, up, rev, is_rev):
+    state = "逆位" if is_rev else "正位"
+    meaning = (rev if is_rev else up)
+    return f"{name}（{state}）\n→ {meaning}"
 
 # --- 健康檢查 ---
 @app.get("/")
@@ -246,7 +245,6 @@ def handle_text(event):
     typing_timer = _schedule_typing(target_id, delay=TYPING_DELAY_SEC) if target_id else None
 
     IMG_ALIASES = ("/img ", "/圖 ", "/圖片 ", "/pic ", "/photo ")
-    TAROT_ALIASES = ("/tarot", "/塔羅", "/抽牌")
 
     try:
         # --- 圖片搜尋：Pexels；找不到退 Picsum ---
@@ -261,44 +259,91 @@ def handle_text(event):
             )
             return
 
-        # --- 塔羅：/tarot、/塔羅、/抽牌 [1|3] ---
-        if any(text_lower.startswith(a) for a in TAROT_ALIASES):
-            parts = text_raw.split()
-            n = 1
-            if len(parts) >= 2:
-                try:
-                    n = 3 if int(parts[1]) >= 3 else 1
-                except Exception:
-                    n = 1
-            spread = draw_tarot(n)
-            if n == 1:
-                msg = "【今日指引】\n\n" + tarot_to_text(spread)
-            else:
-                msg = "【三張牌：過去 / 現在 / 未來】\n\n" + tarot_to_text(
-                    spread, positions=["過去", "現在", "未來"]
-                )
+        # --- /塔羅：顯示五個按鈕 ---
+        if text_lower == "/塔羅":
+            qr = QuickReply(items=[
+                QuickReplyButton(action=MessageAction(label="最近財運", text="最近財運")),
+                QuickReplyButton(action=MessageAction(label="感情狀況", text="感情狀況")),
+                QuickReplyButton(action=MessageAction(label="今日運勢", text="今日運勢")),
+                QuickReplyButton(action=MessageAction(label="工作順利嗎", text="工作順利嗎")),
+                QuickReplyButton(action=MessageAction(label="停止占卜", text="停止占卜")),
+            ])
             if typing_timer: typing_timer.cancel()
-            # 回主文字
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg))
-            # 附一張塔羅風格圖（push）
-            if target_id:
-                cover = tarot_cover_image("Tarot card, Major Arcana")
-                line_bot_api.push_message(target_id, ImageSendMessage(
-                    original_content_url=cover, preview_image_url=cover
-                ))
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="請選擇你想占卜的問題：", quick_reply=qr)
+            )
             return
 
-       # ---- 其他指令 / 一般聊天 ----
-        if text_lower in ("hi", "hello", "嗨"):
+        # --- 選題：建立 1 張或 3 張模式 ---
+        if text_raw in ("最近財運", "感情狀況", "今日運勢", "工作順利嗎", "停止占卜"):
+            if text_raw == "停止占卜":
+                TAROT_SESSIONS.pop(chat_key(event), None)
+                final_reply = "已停止占卜。需要時再輸入 /塔羅 開始。"
+            else:
+                mode = 1 if text_raw == "今日運勢" else 3
+                TAROT_SESSIONS[chat_key(event)] = {
+                    "mode": mode,
+                    "remaining": mode,
+                    "picked": [],
+                    "question": text_raw
+                }
+                qr = QuickReply(items=[QuickReplyButton(action=MessageAction(label="抽牌", text="抽牌"))])
+                msg = (f"問題：{text_raw}\n請選擇第 1 張牌（1~78 的數字），或點下方『抽牌』按鈕。"
+                       
+  if typing_timer: typing_timer.cancel()
+                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=qr))
+                return
+
+        # --- 抽牌/輸入號碼：逐張揭示與總結 ---
+        if text_raw == "抽牌" or (text_raw.isdigit() and 1 <= int(text_raw) <= 78):
+            sess = TAROT_SESSIONS.get(chat_key(event))
+            if not sess:
+                final_reply = "目前沒有進行中的占卜。請輸入 /塔羅 開始。"
+            else:
+                name, up, rev, is_rev = draw_one_tarot()
+                sess["picked"].append((name, up, rev, is_rev))
+                sess["remaining"] -= 1
+
+                if sess["mode"] == 3:
+                    pos = POS_LABELS[len(sess["picked"]) - 1]
+                    header = f"\n"
+                else:
+                    header = "【今日指引】\n"
+
+                reveal = header + tarot_line(name, up, rev, is_rev)
+
+                if sess["remaining"] > 0:
+                    qr = QuickReply(items=[QuickReplyButton(action=MessageAction(label="抽牌", text="抽牌"))])
+                    msg = f"{reveal}\n\n請選擇第 {len(sess['picked'])+1} 張牌（1~78），或點『抽牌』。"
+                    if typing_timer: typing_timer.cancel()
+                    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=qr))
+                    return
+                else:
+                    # 完成
+                    if sess["mode"] == 3:
+                        lines = []
+                        for (pname, pup, prev, pis_rev), pos in zip(sess["picked"], POS_LABELS):
+                            lines.append(f"{pos}：{tarot_line(pname, pup, prev, pis_rev)}")
+                        summary = "【三張牌總結】\n\n" + "\n\n".join(lines)
+                    else:
+                        summary = reveal + "\n\n占卜完成，祝順心！"
+                    TAROT_SESSIONS.pop(chat_key(event), None)
+                    final_reply = summary
+
+        # ---- 其他指令 / 一般聊天 ----
+        elif text_lower in ("hi", "hello", "嗨"):
             final_reply = "哈囉，我是你的小助理！輸入 /help 看功能。"
         elif text_lower == "/help":
-            final_reply = ("指令：\n"
-                           "- /img 或 /圖 /圖片 /pic /photo <內容>：關鍵字找圖（Pexels，找不到回隨機圖）\n"
-                           "- /tarot 或 /塔羅 或 /抽牌 [1|3]：抽塔羅（預設 1 張；3=過去/現在/未來）\n"
-                           "- /id：顯示你的使用者ID\n"
-                           "- /time：伺服器時間\n"
-                           "- /engine：目前使用的回覆引擎\n"
-                           "- 其他訊息：由 AI 回覆（若無 API key 則回 Echo）")
+            final_reply = (
+                "指令：\n"
+                "- /圖 或 /img /圖片 /pic /photo <內容>：Pexels 找圖（找不到回隨機圖）\n"
+                "- /塔羅：按鈕選題，支援 1 張或 3 張抽牌\n"
+                "- /id：顯示你的使用者ID\n"
+                "- /time：伺服器時間\n"
+                "- /engine：目前使用的回覆引擎\n"
+                "- 其他訊息：由 AI 回覆（若無 API key 則回 Echo）"
+            )
         elif text_lower == "/id":
             final_reply = f"你的ID：{event.source.user_id}"
         elif text_lower == "/time":
@@ -326,10 +371,11 @@ def handle_text(event):
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=final_reply))
     except Exception as e:
         print("[reply] failed, fallback to push:", e)
-        if target_id:
-            line_bot_api.push_message(target_id, TextSendMessage(text=final_reply))
+        target = _push_target_id(event)
+        if target:
+            line_bot_api.push_message(target, TextSendMessage(text=final_reply))
 
-# --- 處理用戶上傳的圖片（存檔回連結） ---
+# --- 用戶上傳圖片：存檔回連結 ---
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
     try:
