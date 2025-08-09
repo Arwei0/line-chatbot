@@ -34,7 +34,7 @@ if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
 line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(CHANNEL_SECRET)
 
-# === 檔案儲存：提供公開網址 (/files/...) 給 LINE 載圖 ===
+# === 檔案儲存：提供公開網址 (/files/...) 給 LINE 載圖（接收用戶上傳用） ===
 UPLOAD_DIR = "/tmp/uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -42,7 +42,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 def serve_file(fname):
     return send_from_directory(UPLOAD_DIR, fname, as_attachment=False)
 
-# === AI 客戶端（兩個都有時優先 OpenAI） ===
+# === AI 客戶端（兩個都有時優先 OpenAI）— 只影響文字聊天，不影響 /img ===
 client_openai = None
 client_gemini = None
 if OPENAI_API_KEY:
@@ -62,6 +62,7 @@ if GEMINI_API_KEY and client_openai is None:
 SYSTEM_PROMPT = "你是友善、清楚的中文助理，回覆要重點清楚、必要時給步驟與範例。"
 
 def ask_ai(user_text: str) -> str:
+    """文字對話：有 OpenAI 用 OpenAI；否則用 Gemini；都沒有就 Echo。"""
     if client_openai:
         print("[ai] using openai")
         resp = client_openai.chat.completions.create(
@@ -81,35 +82,11 @@ def ask_ai(user_text: str) -> str:
     print("[ai] no api key -> echo")
     return f"你說：{user_text}"
 
-# === 影像生成（OpenAI） ===
-def generate_image_openai(prompt: str, size: str = "1024x1024") -> str:
-    """
-    使用 gpt-image-1 生成圖片，存檔並回傳公開 URL。
-    需 OPENAI_API_KEY；回傳 public_url。
-    """
-    if not client_openai:
-        raise RuntimeError("缺少 OPENAI_API_KEY，無法生成圖片")
-    print("[img] generating with gpt-image-1:", prompt)
-    result = client_openai.images.generate(
-        model="gpt-image-1",
-        prompt=prompt,
-        size=size,
-        response_format="b64_json",
-    )
-    b64 = result.data[0].b64_json
-    img_bytes = base64.b64decode(b64)
-    fname = f"{uuid.uuid4().hex}.png"
-    fpath = os.path.join(UPLOAD_DIR, fname)
-    with open(fpath, "wb") as f:
-        f.write(img_bytes)
-    public_url = request.url_root.rstrip("/") + f"/files/{fname}"
-    return public_url
-
 # === 群組觸發詞 ===
 GROUP_TRIGGERS = ("@bot", "/ai", "小幫手")
-TYPING_DELAY_SEC = 1.0  # 智慧「正在輸入中…」延遲秒數（<delay 回答就不顯示提示）
 
 def _should_reply_in_context(event, text_lower: str) -> bool:
+    """私訊一律回；群組/多人聊天室需觸發詞開頭"""
     st = getattr(event.source, "type", "user")
     if st == "user":
         return True
@@ -131,6 +108,9 @@ def _push_target_id(event):
     if st == "room":
         return event.source.room_id
     return None
+
+# === 智慧「正在輸入中…」：延遲 1 秒才送；若答案先準備好就取消，不會出現 ===
+TYPING_DELAY_SEC = 1.0
 
 def _schedule_typing(target_id, delay=TYPING_DELAY_SEC):
     def _send():
@@ -158,11 +138,11 @@ def callback():
         abort(400)
     return "OK"
 
-@app.post("/webhook")
+@app.post("/webhook")  # 若後台填 /webhook 也相容
 def webhook_alias():
     return callback()
 
-# --- 文字訊息處理（含：即時生成圖片） ---
+# --- 文字訊息處理（含：/img 走 Picsum 隨機圖） ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text_raw = (event.message.text or "").strip()
@@ -179,47 +159,25 @@ def handle_text(event):
     target_id = _push_target_id(event)
     typing_timer = _schedule_typing(target_id, delay=TYPING_DELAY_SEC) if target_id else None
 
-    # --- 判斷是否為「生成圖片」需求 ---
-    # 觸發條件：/img 開頭，或同時包含「生成/畫/做」+「圖/圖片/照片」
-    want_image = False
-    img_prompt = None
-    if text_lower.startswith(("/img", "/image", "/畫")):
-        want_image = True
-        img_prompt = text_raw.split(maxsplit=1)[1] if len(text_raw.split()) > 1 else "你腦海中的畫面"
-    elif (("生成" in text_lower or "畫" in text_lower or "做" in text_lower) and
-          ("圖" in text_lower or "圖片" in text_lower or "照片" in text_lower)):
-        want_image = True
-        # 去掉常見動詞與關鍵字，取剩餘為提示
-        tmp = text_raw.replace("生成", "").replace("圖片", "").replace("照片", "").replace("圖", "").replace("幫我", "").strip()
-        img_prompt = tmp if tmp else "你腦海中的畫面"
-
-    # --- 處理邏輯 ---
     try:
-        if want_image:
-            if not client_openai:
-                final_text = "目前僅支援使用 OpenAI 的圖像生成功能，請設定 OPENAI_API_KEY 後再試一次唷。"
-                # 取消 typing
-                if typing_timer: typing_timer.cancel()
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=final_text))
-                return
-
-            # 生成圖片
-            public_url = generate_image_openai(img_prompt)
-            # 取消 typing
+        # --- /img：用 Picsum 回一張隨機圖（免費、零金鑰） ---
+        if text_lower.startswith("/img "):
+            # 保留關鍵字但 Picsum 不支援查詢，純隨機圖
+            # 你之後拿到 Pexels key 再把這裡改掉即可
+            img_url = "https://picsum.photos/1024"
             if typing_timer: typing_timer.cancel()
-            # 直接回一張圖（reply 一次搞定）
             line_bot_api.reply_message(
                 event.reply_token,
-                ImageSendMessage(original_content_url=public_url, preview_image_url=public_url)
+                ImageSendMessage(original_content_url=img_url, preview_image_url=img_url)
             )
             return
 
-        # ---- 一般文字 / 指令 → 走 AI 或固定回覆 ----
+        # ---- 一般指令 / 文字 → 走 AI 或固定回覆 ----
         if text_lower in ("hi", "hello", "嗨"):
             final_reply = "哈囉，我是你的小助理！輸入 /help 看功能。"
         elif text_lower == "/help":
             final_reply = ("指令：\n"
-                           "- /img <內容>：生成圖片（例：/img 可愛的柴犬在海邊）\n"
+                           "- /img <內容>：回一張隨機圖片（Picsum，之後可換 Pexels 搜圖）\n"
                            "- /id：顯示你的使用者ID\n"
                            "- /time：伺服器時間\n"
                            "- /engine：目前使用的回覆引擎\n"
@@ -254,7 +212,7 @@ def handle_text(event):
         if target_id:
             line_bot_api.push_message(target_id, TextSendMessage(text=final_reply))
 
-# ---（可選）處理用戶上傳的圖片：存檔後回傳 ---
+# ---（選配）處理用戶上傳的圖片：存檔後回傳 ---
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image(event):
     try:
