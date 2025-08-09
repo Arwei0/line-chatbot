@@ -12,7 +12,7 @@ if not CHANNEL_ACCESS_TOKEN:
 api = LineBotApi(CHANNEL_ACCESS_TOKEN)
 
 # 1x3 小版型：2500 x 843
-W, H = 2500, 843
+W, H = 2500, 1686
 COL = W // 3  # 833
 
 rich_menu = RichMenu(
