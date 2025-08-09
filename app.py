@@ -288,6 +288,67 @@ def handle_text(event):
                 ))
             return
 
-        # ---- 其他指令 / 一般聊天 ----
+       # ---- 其他指令 / 一般聊天 ----
         if text_lower in ("hi", "hello", "嗨"):
-            final_reply = "哈囉，我是你的小助理！輸入
+            final_reply = "哈囉，我是你的小助理！輸入 /help 看功能。"
+        elif text_lower == "/help":
+            final_reply = ("指令：\n"
+                           "- /img 或 /圖 /圖片 /pic /photo <內容>：關鍵字找圖（Pexels，找不到回隨機圖）\n"
+                           "- /tarot 或 /塔羅 或 /抽牌 [1|3]：抽塔羅（預設 1 張；3=過去/現在/未來）\n"
+                           "- /id：顯示你的使用者ID\n"
+                           "- /time：伺服器時間\n"
+                           "- /engine：目前使用的回覆引擎\n"
+                           "- 其他訊息：由 AI 回覆（若無 API key 則回 Echo）")
+        elif text_lower == "/id":
+            final_reply = f"你的ID：{event.source.user_id}"
+        elif text_lower == "/time":
+            import datetime
+            final_reply = f"現在時間：{datetime.datetime.now()}"
+        elif text_lower == "/engine":
+            engine = "openai" if client_openai else ("gemini" if client_gemini else "echo")
+            final_reply = f"目前引擎：{engine}"
+        else:
+            final_reply = ask_ai(text_raw) or f"你說：{text_raw}"
+
+    except Exception as e:
+        print("[handler] error:", e)
+        final_reply = f"你說：{text_raw}"
+
+    # 取消 typing（如果還沒送出）
+    try:
+        if typing_timer:
+            typing_timer.cancel()
+    except Exception:
+        pass
+
+    # 回覆文字（優先 reply；失敗改 push）
+    try:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=final_reply))
+    except Exception as e:
+        print("[reply] failed, fallback to push:", e)
+        if target_id:
+            line_bot_api.push_message(target_id, TextSendMessage(text=final_reply))
+
+# --- 處理用戶上傳的圖片（存檔回連結） ---
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image(event):
+    try:
+        content = line_bot_api.get_message_content(event.message.id)
+        fname = f"{uuid.uuid4().hex}.jpg"
+        fpath = os.path.join(UPLOAD_DIR, fname)
+        with open(fpath, "wb") as f:
+            for chunk in content.iter_content():
+                f.write(chunk)
+        public_url = request.url_root.rstrip("/") + f"/files/{fname}"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"我收到你的圖片！連結：{public_url}"))
+        target_id = _push_target_id(event)
+        if target_id:
+            line_bot_api.push_message(target_id, ImageSendMessage(
+                original_content_url=public_url, preview_image_url=public_url
+            ))
+    except Exception as e:
+        print("[image] save failed:", e)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="抱歉，圖片儲存失敗。"))
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT)
