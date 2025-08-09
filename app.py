@@ -5,8 +5,9 @@ from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
     ImageMessage, ImageSendMessage
 )
-import os, time, threading, uuid, base64
+import os, threading, uuid, base64
 from dotenv import load_dotenv
+import requests  # Pexels
 
 # 讀 .env（支援含 BOM）
 load_dotenv(encoding="utf-8-sig")
@@ -18,6 +19,7 @@ CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 PORT = int(os.getenv("PORT", 5000))
 
 def _mask(s):
@@ -26,7 +28,8 @@ def _mask(s):
 print("[env] LINE_TOKEN:", _mask(CHANNEL_ACCESS_TOKEN),
       "LINE_SECRET:", _mask(CHANNEL_SECRET),
       "OPENAI:", bool(OPENAI_API_KEY),
-      "GEMINI:", bool(GEMINI_API_KEY))
+      "GEMINI:", bool(GEMINI_API_KEY),
+      "PEXELS:", bool(PEXELS_API_KEY))
 
 if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
     raise RuntimeError("缺少 LINE_CHANNEL_ACCESS_TOKEN 或 LINE_CHANNEL_SECRET，請檢查環境變數。")
@@ -82,6 +85,27 @@ def ask_ai(user_text: str) -> str:
     print("[ai] no api key -> echo")
     return f"你說：{user_text}"
 
+# === 影像生成（OpenAI：gpt-image-1）—若未設 OPENAI_API_KEY 就不使用 ===
+def generate_image_openai(prompt: str, size: str = "1024x1024") -> str:
+    """使用 gpt-image-1 生成圖片，存檔並回傳公開 URL。"""
+    if not client_openai:
+        raise RuntimeError("缺少 OPENAI_API_KEY，無法生成圖片")
+    print("[img] generating with gpt-image-1:", prompt)
+    result = client_openai.images.generate(
+        model="gpt-image-1",
+        prompt=prompt,
+        size=size,
+        response_format="b64_json",
+    )
+    b64 = result.data[0].b64_json
+    img_bytes = base64.b64decode(b64)
+    fname = f"{uuid.uuid4().hex}.png"
+    fpath = os.path.join(UPLOAD_DIR, fname)
+    with open(fpath, "wb") as f:
+        f.write(img_bytes)
+    public_url = request.url_root.rstrip("/") + f"/files/{fname}"
+    return public_url
+
 # === 群組觸發詞 ===
 GROUP_TRIGGERS = ("@bot", "/ai", "小幫手")
 
@@ -122,6 +146,25 @@ def _schedule_typing(target_id, delay=TYPING_DELAY_SEC):
     t.start()
     return t
 
+# === Pexels 搜圖：回一張可直接給 LINE 的大圖 URL；找不到回 None ===
+def pexels_search_image(query: str) -> str | None:
+    if not PEXELS_API_KEY:
+        return None
+    try:
+        url = "https://api.pexels.com/v1/search"
+        params = {"query": query, "per_page": 1, "orientation": "landscape"}
+        headers = {"Authorization": PEXELS_API_KEY}
+        r = requests.get(url, params=params, headers=headers, timeout=12)
+        r.raise_for_status()
+        photos = r.json().get("photos", [])
+        if not photos:
+            return None
+        src = photos[0].get("src", {})
+        return src.get("large2x") or src.get("original") or src.get("large")
+    except Exception as e:
+        print("[pexels] search error:", e)
+        return None
+
 # --- 健康檢查 ---
 @app.get("/")
 def health():
@@ -142,7 +185,7 @@ def callback():
 def webhook_alias():
     return callback()
 
-# --- 文字訊息處理（含：/img 走 Picsum 隨機圖） ---
+# --- 文字訊息處理（含：/img 走 Pexels，找不到退 Picsum；若你有 OpenAI 也可改生圖） ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_text(event):
     text_raw = (event.message.text or "").strip()
@@ -160,11 +203,25 @@ def handle_text(event):
     typing_timer = _schedule_typing(target_id, delay=TYPING_DELAY_SEC) if target_id else None
 
     try:
-        # --- /img：用 Picsum 回一張隨機圖（免費、零金鑰） ---
+        # --- /img：依關鍵字找圖（Pexels），找不到退 Picsum ---
         if text_lower.startswith("/img "):
-            # 保留關鍵字但 Picsum 不支援查詢，純隨機圖
-            # 你之後拿到 Pexels key 再把這裡改掉即可
-            img_url = "https://picsum.photos/1024"
+            query = text_raw[5:].strip()
+
+            # 有 Gemini 的話，先把關鍵字精煉成英文（命中率更高）— 沒有也可略過
+            search_kw = query
+            if client_gemini:
+                try:
+                    resp = client_gemini.generate_content(
+                        ["請將以下需求濃縮成 3~5 個英文關鍵字，逗號分隔：", query]
+                    )
+                    kw = (getattr(resp, "text", "") or "").strip()
+                    if kw:
+                        search_kw = kw
+                except Exception:
+                    pass
+
+            img_url = pexels_search_image(search_kw) or "https://picsum.photos/1024"
+
             if typing_timer: typing_timer.cancel()
             line_bot_api.reply_message(
                 event.reply_token,
@@ -177,7 +234,7 @@ def handle_text(event):
             final_reply = "哈囉，我是你的小助理！輸入 /help 看功能。"
         elif text_lower == "/help":
             final_reply = ("指令：\n"
-                           "- /img <內容>：回一張隨機圖片（Picsum，之後可換 Pexels 搜圖）\n"
+                           "- /img <內容>：依關鍵字找圖（Pexels，免費；找不到則回隨機圖）\n"
                            "- /id：顯示你的使用者ID\n"
                            "- /time：伺服器時間\n"
                            "- /engine：目前使用的回覆引擎\n"
