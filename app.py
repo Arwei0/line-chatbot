@@ -2,7 +2,7 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-import os, time
+import os, time, threading
 from dotenv import load_dotenv
 
 # 讀 .env（支援含 BOM）
@@ -72,9 +72,9 @@ def ask_ai(user_text: str) -> str:
 
 # === 群組觸發詞 ===
 GROUP_TRIGGERS = ("@bot", "/ai", "小幫手")
-TYPING_DELAY_SEC = 0  # 想固定延遲可改成 1.2 之類
 
 def _should_reply_in_context(event, text_lower: str) -> bool:
+    """私訊一律回；群組/多人聊天室需觸發詞開頭"""
     st = getattr(event.source, "type", "user")
     if st == "user":
         return True
@@ -96,6 +96,20 @@ def _push_target_id(event):
     if st == "room":
         return event.source.room_id
     return None
+
+# === 智慧「正在輸入中…」：延遲 1 秒才送；若答案先準備好就取消，不會出現 ===
+TYPING_DELAY_SEC = 1.0
+
+def _schedule_typing(target_id, delay=TYPING_DELAY_SEC):
+    """排程在 delay 秒後送出『正在輸入中…』，回傳 Timer 物件"""
+    def _send():
+        try:
+            line_bot_api.push_message(target_id, TextSendMessage(text="正在輸入中…"))
+        except Exception as e:
+            print("[typing] push failed:", e)
+    t = threading.Timer(delay, _send)
+    t.start()
+    return t
 
 # --- 健康檢查 ---
 @app.get("/")
@@ -131,47 +145,51 @@ def handle_text(event):
     text_raw = _strip_trigger_prefix(text_raw)
     text_lower = text_raw.lower()
 
-    # 先回「…」當 typing 指示（reply_token 只能用一次）
-    try:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="…"))
-    except Exception as e:
-        print("[typing] reply '…' failed:", e)
-
-    # 準備真正回覆內容
-    if text_lower in ("hi", "hello", "嗨"):
-        final_reply = "哈囉，我是你的小助理！輸入 /help 看功能。"
-    elif text_lower == "/help":
-        final_reply = ("指令：\n"
-                       "- /id：顯示你的使用者ID\n"
-                       "- /time：伺服器時間\n"
-                       "- /engine：目前使用的回覆引擎\n"
-                       "- 其他訊息：由 AI 回覆（若無 API key 則回 Echo）")
-    elif text_lower == "/id":
-        final_reply = f"你的ID：{event.source.user_id}"
-    elif text_lower == "/time":
-        import datetime
-        final_reply = f"現在時間：{datetime.datetime.now()}"
-    elif text_lower == "/engine":
-        engine = "openai" if client_openai else ("gemini" if client_gemini else "echo")
-        final_reply = f"目前引擎：{engine}"
-    else:
-        try:
-            final_reply = ask_ai(text_raw) or f"你說：{text_raw}"
-        except Exception as e:
-            print("[ai] error -> fallback echo:", e)
-            final_reply = f"你說：{text_raw}"
-
-    # 可選固定延遲，讓「…」多停留一下
-    if TYPING_DELAY_SEC > 0:
-        time.sleep(TYPING_DELAY_SEC)
-
-    # 用 push 把真正回覆送到同一個對話
     target_id = _push_target_id(event)
+
+    # 1) 先預約 1 秒後送『正在輸入中…』
+    typing_timer = None
     if target_id:
-        try:
+        typing_timer = _schedule_typing(target_id, delay=TYPING_DELAY_SEC)
+
+    # 2) 準備真正回覆
+    try:
+        if text_lower in ("hi", "hello", "嗨"):
+            final_reply = "哈囉，我是你的小助理！輸入 /help 看功能。"
+        elif text_lower == "/help":
+            final_reply = ("指令：\n"
+                           "- /id：顯示你的使用者ID\n"
+                           "- /time：伺服器時間\n"
+                           "- /engine：目前使用的回覆引擎\n"
+                           "- 其他訊息：由 AI 回覆（若無 API key 則回 Echo）")
+        elif text_lower == "/id":
+            final_reply = f"你的ID：{event.source.user_id}"
+        elif text_lower == "/time":
+            import datetime
+            final_reply = f"現在時間：{datetime.datetime.now()}"
+        elif text_lower == "/engine":
+            engine = "openai" if client_openai else ("gemini" if client_gemini else "echo")
+            final_reply = f"目前引擎：{engine}"
+        else:
+            final_reply = ask_ai(text_raw) or f"你說：{text_raw}"
+    except Exception as e:
+        print("[ai] error -> fallback echo:", e)
+        final_reply = f"你說：{text_raw}"
+
+    # 3) 如果在 delay 內算好 → 取消『正在輸入中…』的排程（就不會出現）
+    try:
+        if typing_timer:
+            typing_timer.cancel()
+    except Exception:
+        pass
+
+    # 4) 最終只送一次真正回覆（優先用 reply；失敗就 push）
+    try:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=final_reply))
+    except Exception as e:
+        print("[reply] failed, fallback to push:", e)
+        if target_id:
             line_bot_api.push_message(target_id, TextSendMessage(text=final_reply))
-        except Exception as e:
-            print("[push] failed:", e)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
