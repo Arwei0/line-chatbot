@@ -388,16 +388,22 @@ def handle_image(event):
         with open(fpath, "wb") as f:
             for chunk in content.iter_content():
                 f.write(chunk)
+
         public_url = request.url_root.rstrip("/") + f"/files/{fname}"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"我收到你的圖片！連結：{public_url}"))
-        target_id = _push_target_id(event)
-        if target_id:
-            line_bot_api.push_message(target_id, ImageSendMessage(
-                original_content_url=public_url, preview_image_url=public_url
-            ))
+
+        if getattr(event.source, "type", "user") == "user":
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"已收到你的圖片 ✅\n連結：{public_url}")
+            )
+        else:
+            # 群組/聊天室：安靜不回
+            pass
+
     except Exception as e:
         print("[image] save failed:", e)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="抱歉，圖片儲存失敗。"))
+        if getattr(event.source, "type", "user") == "user":
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="抱歉，圖片儲存失敗。"))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
